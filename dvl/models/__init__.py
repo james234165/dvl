@@ -1,4 +1,3 @@
-import copy
 import warnings
 from abc import ABC, abstractmethod
 from typing import Dict, List
@@ -170,9 +169,6 @@ class QwenVL(ModelConfig):
         self.default_engine_args["model"] = model_id
         self.default_engine_args["config_format"] = "hf"
 
-        # if "qwen2.5" in model_id.lower() and ("32b" in model_id.lower() or "72b" in model_id.lower()):
-        #     self.default_engine_args["config_format"] = "hf"
-
         if max_tokens is not None and max_tokens > 32768:
             warnings.warn(f"maximum context length of qwen2.5 is 32768 tokens smaller than your input {max_tokens}! "
                            f"Clip your max_tokens to 32768.")
@@ -229,8 +225,6 @@ class QwenVL(ModelConfig):
 
             multimodal_inputs = {
                 "multi_modal_data": {"video": video_inputs},
-                # FPS will be returned in video_kwargs
-                # "mm_processor_kwargs": video_kwargs,
             }
             return prompt_text, multimodal_inputs
         else:
@@ -420,7 +414,6 @@ class Llava(ModelConfig):
             return prompt
 
 
-# TODO: explicitly encode the mapping between model_id and ModelConfig class
 def build_model_config(model_id: str, **kwargs) -> ModelConfig:
     if "llava" in model_id.lower():
         model_config = Llava(model_id=model_id, **kwargs)

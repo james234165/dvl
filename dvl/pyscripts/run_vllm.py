@@ -173,7 +173,6 @@ def get_messages_from_data(data_dict: Dict, subset: str, model_id: str, used_pro
 
 
 def create_batch_inputs(data_list: List[Dict], model_config: ModelConfig, args):
-    """创建批处理输入"""
     for i in range(0, len(data_list), args.batch_size):
         batch_data = data_list[i:i + args.batch_size]
         batch_inputs = []
