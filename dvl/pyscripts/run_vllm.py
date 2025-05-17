@@ -9,30 +9,13 @@ from PIL import Image
 from PIL.Image import Resampling
 from tqdm import tqdm
 from transformers import GenerationConfig
-try:
-    from vllm import EngineArgs, LLM, SamplingParams
-except ModuleNotFoundError:
-    pass
+from vllm import EngineArgs, LLM, SamplingParams
 
-from cmu_nwu_nlp.models import build_model_config, ModelConfig
+from dvl.models import build_model_config, ModelConfig
 
 
 PROJECT_ROOT = dirname(dirname(dirname(abspath(__file__))))
 CURRENT_DIR = dirname(abspath(__file__))
-
-
-server_name = os.getenv('SERVER_NAME', "nvidia")
-if server_name == "nvidia":
-    data_root = "/home/jovyan/workspace/datasets"
-    mt_data_root = f"{data_root}/multitemp_naip_0414_submit/test_bench"
-elif server_name == "tsubame_mei":
-    data_root = "/gs/fs/tga-miyazakiML/mei/datasets"
-    mt_data_root = "/gs/fs/tga-miyazakiML/mei/datasets/multitemp_naip_0414_submit/test_bench"
-elif server_name == "miyabi":
-    data_root = "/work/jh250017/m57001/datasets"
-    mt_data_root = "/work/jh250017/m57001/datasets/multitemp_naip_0414_submit/test_bench"
-else:
-    raise ValueError("Unknown server name")
 
 
 prompt_libs = dict(
@@ -146,10 +129,9 @@ def get_messages_from_data(data_dict: Dict, subset: str, model_id: str, used_pro
 
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt_splits[0]}]}]
 
+        image_root = f"{PROJECT_ROOT}/data/test"
         if subset == "regional_caption":
-            image_root = f"{data_root}/MultiTempData/test/regional_caption/images"
-        else:
-            image_root = mt_data_root
+            image_root = image_root + f"/regional_caption/images"
 
         if "llava" in model_id.lower():
             video = [join(image_root, image_path) for image_path in data_dict["image_list"]]
@@ -171,7 +153,7 @@ def get_messages_from_data(data_dict: Dict, subset: str, model_id: str, used_pro
 
     elif subset in ["eco_assessment"]:
         prompt_text = used_prompt_libs[subset].format(prompt=data_dict["prompts"], options_str=data_dict["options_str"])
-        image_path = join(mt_data_root, data_dict["image_path"])
+        image_path = join(f"{PROJECT_ROOT}/data/test", data_dict["image_path"])
 
         images = [image_path]
         messages = [
@@ -191,6 +173,7 @@ def get_messages_from_data(data_dict: Dict, subset: str, model_id: str, used_pro
 
 
 def create_batch_inputs(data_list: List[Dict], model_config: ModelConfig, args):
+    """创建批处理输入"""
     for i in range(0, len(data_list), args.batch_size):
         batch_data = data_list[i:i + args.batch_size]
         batch_inputs = []
@@ -233,7 +216,7 @@ if __name__ == '__main__':
     reformat_model_id = "/".join(args.model_id.strip("/").split("/")[-2:]).replace('/', '--')
     if args.image_size is not None:
         reformat_model_id = reformat_model_id + f"_{args.image_size}"
-    result_save_path = join(PROJECT_ROOT, "results", "multi_temp", args.subset, reformat_model_id, "finished.jsonl")
+    result_save_path = join(PROJECT_ROOT, "results", args.subset, reformat_model_id, "finished.jsonl")
     os.makedirs(dirname(result_save_path), exist_ok=True)
 
     finish_ids = []
@@ -248,7 +231,7 @@ if __name__ == '__main__':
     else:
         print(f"Start from scratch")
 
-    subset_json = join(data_root, "MultiTempData/test", f"{args.subset}.json")
+    subset_json = join(f"{PROJECT_ROOT}/data/test", f"{args.subset}.json")
     print("Reading data from {}".format(subset_json))
     with open(subset_json, "r") as f:
         ds = json.load(f)
