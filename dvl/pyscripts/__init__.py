@@ -1,57 +1,358 @@
 import argparse
 import asyncio
-import copy
 import glob
 import json
 import logging
-import math
 import os
 import random
 import string
-from enum import Enum
-from os.path import dirname, basename
-from typing import Dict, List
+from os.path import dirname, basename, abspath
 
-import numpy as np
-import torch
-import torch.nn.functional as F
+from openai import AsyncAzureOpenAI
+from tqdm.asyncio import tqdm_asyncio
+
 from prettytable import PrettyTable, HRuleStyle
+
+import copy
+from enum import Enum
+from typing import Union, List, Any, Dict
+
+import math
+import torch
+import numpy as np
+
 from scipy import stats
 
-try:
-    from openai import AsyncAzureOpenAI
-    from tqdm.asyncio import tqdm_asyncio
 
-    HAS_OPENAI = True
-except ImportError:
-    HAS_OPENAI = False
+class AggregationMode(Enum):
+    SKIP = 0  # skip aggregation
+    MEAN = 1  # calculate mean value
+    TOTAL = 2  # calculate total sum
+    QUANTITY = 3  # count elements
 
-# Global configurations
+
+class MetricAccumulator(object):
+
+    def __init__(self, metric_name, display_format=":f", aggregate_mode=AggregationMode.MEAN):
+        self.metric_name = metric_name
+        self.display_format = display_format
+        self.aggregate_mode = aggregate_mode
+        self.initialize()
+
+    def initialize(self):
+        # Clear all stored values
+        self.current_value = 0
+        self.mean_value = 0
+        self.accumulated_sum = 0
+        self.sample_count = 0
+
+    def record(self, new_value, sample_size=1):
+        # Update current value and accumulate statistics
+        self.current_value = new_value
+        self.accumulated_sum += new_value * sample_size  # weighted sum
+        self.sample_count += sample_size
+        # Compute running average on-the-fly
+        if self.sample_count > 0:
+            self.mean_value = self.accumulated_sum / self.sample_count
+
+    def __str__(self):
+        # Custom string representation
+        format_template = "{metric_name} {current_value" + self.display_format + "} ({mean_value" + self.display_format + "})"
+        return format_template.format(**self.__dict__)
+
+    def get_summary(self):
+        # Generate summary based on aggregation mode
+        output_format = ""
+        if self.aggregate_mode is AggregationMode.SKIP:
+            output_format = ""  # no summary
+        elif self.aggregate_mode is AggregationMode.MEAN:
+            output_format = "{metric_name} {mean_value:.3f}"
+        elif self.aggregate_mode is AggregationMode.TOTAL:
+            output_format = "{metric_name} {accumulated_sum:.3f}"
+        elif self.aggregate_mode is AggregationMode.QUANTITY:
+            output_format = "{metric_name} {sample_count:.3f}"
+        else:
+            raise ValueError("Unsupported aggregation mode: %r" % self.aggregate_mode)
+
+        return output_format.format(**self.__dict__)
+
+
+def compute_iou_metrics_cuda(predictions, ground_truth, num_categories, excluded_label=255):
+    assert predictions.dim() in [1, 2, 3]
+    assert predictions.shape == ground_truth.shape, f"Shape mismatch: {predictions.shape} vs {ground_truth.shape}"
+    
+    # Flatten tensors for processing
+    pred_flattened = predictions.view(-1)
+    gt_flattened = ground_truth.view(-1)
+    
+    # Apply exclusion mask - ignore pixels with excluded_label
+    pred_flattened[gt_flattened == excluded_label] = excluded_label
+    
+    # Find matching predictions (intersection calculation)
+    matching_pixels = pred_flattened[pred_flattened == gt_flattened]
+    
+    # Generate histograms for each category
+    intersection_hist = torch.histc(matching_pixels, bins=num_categories, min=0, max=num_categories - 1)
+    pred_hist = torch.histc(pred_flattened, bins=num_categories, min=0, max=num_categories - 1)  
+    gt_hist = torch.histc(gt_flattened, bins=num_categories, min=0, max=num_categories - 1)
+    
+    # Calculate union: pred + gt - intersection
+    union_hist = pred_hist + gt_hist - intersection_hist
+    
+    return intersection_hist, union_hist, gt_hist
+
+
+def build_confusion_matrix_fast(pred_array, truth_array, class_count):
+    valid_mask = (pred_array >= 0) & (pred_array < class_count)
+    # Convert to linear indexing: truth * class_count + pred for 2D histogram
+    linear_indices = class_count * pred_array[valid_mask].astype(int) + truth_array[valid_mask]
+    return np.bincount(linear_indices, minlength=class_count ** 2).reshape(class_count, class_count)
+
+
+def generate_histogram_matrix(predicted_img, true_label, category_num):
+    confusion_matrix = np.zeros((category_num, category_num))
+    # Flatten arrays and build histogram
+    flat_pred = predicted_img.flatten()
+    flat_truth = true_label.flatten()
+    confusion_matrix += build_confusion_matrix_fast(flat_pred, flat_truth, category_num)
+    return confusion_matrix
+
+
+def compute_cohen_kappa(confusion_hist):
+    total_samples = confusion_hist.sum()
+    if total_samples == 0:
+        observed_agreement = 0
+        expected_agreement = 1
+        cohen_kappa = 0
+    else:
+        # Calculate observed agreement (diagonal sum / total)
+        observed_agreement = np.diag(confusion_hist).sum() / total_samples
+        # Calculate expected agreement based on marginal distributions
+        row_marginals = confusion_hist.sum(1)  # sum along columns
+        col_marginals = confusion_hist.sum(0)  # sum along rows  
+        expected_agreement = np.matmul(row_marginals, col_marginals.T) / (total_samples ** 2)
+        
+        # Compute Cohen's kappa coefficient
+        if expected_agreement == 1:
+            cohen_kappa = 0  # perfect expected agreement
+        else:
+            cohen_kappa = (observed_agreement - expected_agreement) / (1 - expected_agreement)
+    
+    return cohen_kappa
+
+
+def calculate_prediction_accuracy(predictions, ground_truth_labels, exclude_zeros=False):
+    valid_pixels_mask = (ground_truth_labels >= 0)
+    if exclude_zeros: 
+        # Additional constraint: exclude zero labels
+        valid_pixels_mask = (ground_truth_labels > 0)
+    
+    # Count correct predictions among valid pixels
+    correct_predictions = (valid_pixels_mask * (predictions == ground_truth_labels)).sum()
+    total_valid_pixels = valid_pixels_mask.sum()
+    
+    # Calculate accuracy with numerical stability
+    accuracy_score = float(correct_predictions) / (total_valid_pixels + 1e-10)
+    
+    return accuracy_score, total_valid_pixels
+
+
+def standardize_prediction_labels(
+        prediction_data: Union[torch.Tensor, np.ndarray, List[torch.Tensor or np.ndarray]],
+        reference_data: Union[torch.Tensor, np.ndarray, List[torch.Tensor or np.ndarray]]
+) -> (List[np.ndarray], List[np.ndarray]):
+    
+    def normalize_tensor_arrays(input_arrays):
+        processed_arrays = copy.deepcopy(input_arrays)
+        
+        # Convert PyTorch tensors to NumPy arrays
+        if isinstance(processed_arrays, torch.Tensor):
+            processed_arrays = processed_arrays.numpy()
+            
+        # Handle different input formats
+        if not isinstance(processed_arrays, list):
+            array_shape = processed_arrays.shape
+            # Convert to list based on dimensionality
+            if len(array_shape) in [1, 2]:
+                processed_arrays = [processed_arrays]  # single array
+            elif len(array_shape) == 3:
+                # Split 3D array into list of 2D arrays
+                processed_arrays = [array_slice for array_slice in processed_arrays]
+            else:
+                raise RuntimeError(f"Unsupported tensor shape: {array_shape}")
+
+        # Standardize each array in the list
+        for idx in range(len(processed_arrays)):
+            # Ensure NumPy format
+            if not isinstance(processed_arrays[idx], np.ndarray):
+                processed_arrays[idx] = processed_arrays[idx].numpy()
+            # Flatten and convert to integer type
+            processed_arrays[idx] = processed_arrays[idx].reshape(-1).astype(int)
+            
+        return processed_arrays
+
+    # Process both prediction and reference data
+    processed_predictions = normalize_tensor_arrays(prediction_data)
+    processed_references = normalize_tensor_arrays(reference_data)
+    
+    # Validate array lengths match
+    for pred_array, ref_array in zip(processed_predictions, processed_references):
+        if len(pred_array) != len(ref_array):
+            raise RuntimeError(
+                f"Array length mismatch detected! "
+                f"Prediction array length: {len(pred_array)}, "
+                f"Reference array length: {len(ref_array)}"
+            )
+    
+    return processed_predictions, processed_references
+
+
+class ChangeDetectionMetricsCalculator:
+    def __init__(self, category_count: int):
+        self.category_count = category_count
+        self.initialize_metrics()
+
+    def process_batch(
+            self,
+            reference_labels: Union[torch.Tensor, np.ndarray, List[torch.Tensor or np.ndarray]],
+            predicted_labels: Union[torch.Tensor, np.ndarray, List[torch.Tensor or np.ndarray]],
+            sample_identifiers: Union[List[Any], Any]
+    ):
+        # Standardize input data format
+        pred_arrays, ref_arrays = standardize_prediction_labels(predicted_labels, reference_labels)
+        
+        # Ensure sample_identifiers is a list
+        if not isinstance(sample_identifiers, List):
+            sample_identifiers = [sample_identifiers]
+            
+        # Process each sample pair
+        for sample_idx, (ref_data, pred_data) in enumerate(zip(ref_arrays, pred_arrays)):
+            # Calculate accuracy for this sample
+            sample_accuracy, _ = calculate_prediction_accuracy(pred=pred_data, ground_truth_labels=ref_data)
+            self.accuracy_tracker.record(sample_accuracy)
+
+            # Generate confusion matrix for this sample
+            sample_confusion = generate_histogram_matrix(predicted_img=pred_data, true_label=ref_data, category_num=self.category_count)
+            self.global_confusion_matrix += sample_confusion
+            # Store individual sample results
+            self.sample_metrics[sample_identifiers[sample_idx]] = self.calculate_metrics(hist=sample_confusion)[0]
+
+    def calculate_metrics(self, hist=None) -> (Dict, Dict):
+        # Use global confusion matrix if none provided
+        if hist is None:
+            hist = self.global_confusion_matrix
+
+        # Extract foreground classes (excluding background class 0)
+        foreground_hist = hist[1:, 1:]
+        
+        # Create binary confusion matrix (background vs change)
+        binary_confusion = np.zeros((2, 2))
+        binary_confusion[0][0] = hist[0][0]  # true negative (no change)
+        binary_confusion[0][1] = hist.sum(1)[0] - hist[0][0]  # false positive
+        binary_confusion[1][0] = hist.sum(0)[0] - hist[0][0]  # false negative  
+        binary_confusion[1][1] = foreground_hist.sum()  # true positive (change)
+        
+        # Compute kappa excluding background class
+        hist_no_background = hist.copy()
+        hist_no_background[0][0] = 0  # remove true negatives
+        kappa_coefficient = compute_cohen_kappa(hist_no_background)
+        
+        # Calculate IoU for binary classification
+        intersection_over_union = np.diag(binary_confusion) / (binary_confusion.sum(1) + binary_confusion.sum(0) - np.diag(binary_confusion))
+        foreground_iou = intersection_over_union[1]  # IoU for change class
+        mean_iou = (intersection_over_union[0] + intersection_over_union[1]) / 2
+        
+        # Compute Sek score (kappa * exp(IoU) / e)
+        sek_score = (kappa_coefficient * math.exp(foreground_iou)) / math.e
+
+        # Calculate change detection metrics
+        total_pixels = hist.sum()
+        predicted_change_pixels = total_pixels - hist.sum(1)[0].sum()  # exclude background predictions
+        actual_change_pixels = total_pixels - hist.sum(0)[0].sum()  # exclude background truth
+        change_proportion = actual_change_pixels / total_pixels
+        
+        # True positives for change detection
+        change_true_positives = np.diag(hist[1:, 1:]).sum()
+        
+        # Precision and recall for change detection
+        change_precision = change_true_positives / (predicted_change_pixels + 1e-10)
+        change_recall = change_true_positives / (actual_change_pixels + 1e-10)  # Fixed: should use actual_change_pixels
+        
+        # F-score using harmonic mean
+        f_score_change = stats.hmean([change_precision, change_recall])
+
+        # Compile results dictionary
+        metrics_results = {
+            "kappa_n0": kappa_coefficient,
+            "Fscd": f_score_change,
+            "IoU_mean": mean_iou,
+            "IoU_fg": foreground_iou,
+            "Sek": sek_score,
+            "Acc": self.accuracy_tracker.mean_value,
+            "Precision": change_precision,
+            "Recall": change_recall,
+        }
+        
+        return metrics_results, self.sample_metrics
+
+    def initialize_metrics(self):
+        # Initialize confusion matrix and accuracy tracker
+        self.global_confusion_matrix = np.zeros((self.category_count, self.category_count))
+        self.accuracy_tracker = MetricAccumulator()  # Updated class name
+        self.sample_metrics = {}
+        self.synchronization_flag = False
+
+
+def dict_to_table(data_dict, headers):
+    table = PrettyTable()
+    table.hrules = HRuleStyle.ALL
+
+    max_list_length = max(len(value) for value in data_dict.values())
+
+    table.field_names = headers
+
+    for key, value_list in data_dict.items():
+        row = [key] + value_list + [""] * (max_list_length - len(value_list))
+        table.add_row(row)
+
+    return table
+
+
 CURRENT_DIR = dirname(__file__)
-PROJECT_ROOT = dirname(dirname(dirname(dirname(__file__))))
-DATA_ROOT = os.environ.get('DATA_ROOT', './data')
+PROJECT_ROOT = dirname(dirname(dirname(dirname(abspath(__file__)))))
 
-# SAM preprocessing constants
-sam_pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
-sam_pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
-# Data configuration
+# Data counts for validation
 data_num_libs = {
     "basic_change_choice_qa": 2355,
     "change_speed_choice_qa": 1499,
     "eco_assessment": 14071
 }
 
-SEMANTIC_NAME_TO_LABEL = {
-    'vegetation': 1,
-    'non vegetated surface': 2,
-    'water': 3,
-    'building': 4,
-    'playground': 5
+# Model lists
+API_MODEL_LIST = [
+    # the api models to be evaluated
+]
+
+LOCAL_MODEL_LIST = [
+    # the local models to be evaluated
+]
+
+# Azure OpenAI configuration placeholders
+AZURE_CONFIG = {
+    "AZURE_OPENAI_API_VERSION": "YOUR_API_VERSION",
+    "AZURE_OPENAI_BASE": "YOUR_AZURE_ENDPOINT",
+    "AZURE_OPENAI_KEY": "YOUR_AZURE_KEY"
 }
 
-# Evaluation prompt templates
-BASIC_CHANGE_REPORT_PROMPT = """You are an advanced intelligent chatbot specialized in evaluating remote sensing image change detection results for basic land cover changes. 
+GPT_PROMPTS = {
+    "basic_change_report_qa": """You are an advanced intelligent chatbot specialized in evaluating remote sensing image change detection results for basic land cover changes. 
 Your primary task is to meticulously compare the predicted change description with the ground truth description and assess their accuracy. 
 
 To accomplish this, you will evaluate the results across three key dimensions:
@@ -95,9 +396,9 @@ The predicted time period (2006–2021) exactly matches the ground truth time pe
 <change_quantification_accuracy>3</change_quantification_accuracy>
 <change_quantification_explanation>
 The prediction provides reasonable estimates of overall changes (~20% built-up increase, ~20% vegetation decrease) that roughly align with the ground truth's transition percentages. However, it focuses on net changes rather than specific transition flows and lacks the detailed quantification found in the ground truth.
-</change_quantification_explanation>"""
+</change_quantification_explanation>""",
 
-CHANGE_SPEED_REPORT_PROMPT = """You are an advanced intelligent chatbot specialized in evaluating remote sensing image change detection results.
+    "change_speed_report_qa": """You are an advanced intelligent chatbot specialized in evaluating remote sensing image change detection results.
 Your primary task is to meticulously compare the predicted change detection results with the ground truth results and assess their accuracy. To accomplish this, you will evaluate the results across three key dimensions:
 
 1. Change Rate Precision: 
@@ -136,48 +437,9 @@ The predicted time period (2006 to 2009) exactly matches the ground truth time p
 <change_pattern_accuracy>3</change_pattern_accuracy>
 <change_pattern_accuracy_explanation>
 The prediction correctly identifies urban expansion as the main change type. However, it provides limited information about the spatial distribution of changes and doesn't fully capture the detailed change dynamics described in the ground truth.
-</change_pattern_accuracy_explanation>"""
+</change_pattern_accuracy_explanation>""",
 
-DENSE_TEMPORAL_CAPTION_PROMPT = """You are an advanced intelligent chatbot specialized in evaluating dense temporal captioning for remote sensing image time series.
-
-Your primary task is to meticulously compare the predicted dense temporal caption with the ground truth caption and assess their accuracy. To accomplish this, you will evaluate the captions across three key dimensions:
-
-1. Temporal Coverage: 
-Evaluate how well the predicted caption captures all significant time points and periods of change throughout the entire temporal range. This includes identifying key temporal milestones, maintaining a logical sequence of events, providing appropriate temporal context, and capturing the complete temporal narrative without significant gaps.
-
-2. Spatial Accuracy: 
-Assess how accurately and comprehensively the predicted caption describes the spatial aspects of changes. This includes correctly identifying all regions where significant changes occurred, accurately describing the spatial relationships between different areas, using precise spatial referencing, and ensuring comprehensive coverage of all spatially relevant changes in the image.
-
-3. Process Fidelity:
-Evaluate how accurately and completely the predicted caption describes the nature and processes of change. This includes correctly identifying initial and final land cover/use states, describing intermediate stages of development, capturing the complexity of multiple change processes, and accurately describing the specific features that changed.
-
-Please assign a score for each of these three dimensions, using an integer from 0 to 5, where 5 indicates perfect performance and 0 signifies poor performance. Accompany your assessments with brief explanations to clarify your scoring rationale.
-
-<predicted_caption>
-{predicted_caption}
-</predicted_caption>
-
-<ground_truth_caption>
-{ground_truth_caption}
-</ground_truth_caption>
-
-### OUTPUT FORMAT(EXAMPLE)
-<temporal_coverage>4</temporal_coverage>
-<temporal_coverage_explanation>
-The predicted caption successfully identifies the overall 15-year timeframe and captures key temporal milestones including the development initiation, 2011 halt, 2016 resumption, and 2018-2021 development phase. The chronological order is logical and comprehensive, though it could provide more specific details about the timing of the initial development phase. The caption maintains a clear temporal progression that allows readers to understand the sequence of changes over time.
-</temporal_coverage_explanation>
-
-<spatial_accuracy>5</spatial_accuracy>
-<spatial_accuracy_explanation>
-The caption precisely identifies all significant spatial regions where changes occurred including the top-right, left region, bottom-center, and bottom-right areas with accurate spatial referencing. The spatial coverage is comprehensive, capturing all relevant areas of change mentioned in the ground truth caption. The spatial descriptions effectively communicate the distribution of changes across the image and establish clear relative positions of different development activities.
-</spatial_accuracy_explanation>
-
-<process_fidelity>4</process_fidelity>
-<process_fidelity_explanation>
-The caption accurately describes the transformation from natural and agricultural lands to residential areas with impervious surfaces, buildings, and roads. It captures the phased development process and specifically mentions the office building construction and new water body. The description provides good detail about the conversion processes and infrastructure development. It could provide slightly more detail about the specific characteristics of the residential development in the left region to achieve perfect fidelity.
-</process_fidelity_explanation>"""
-
-REGIONAL_CAPTION_PROMPT = """You are an advanced intelligent chatbot specialized in evaluating regional captions for remote sensing images.
+    "regional_caption": """You are an advanced intelligent chatbot specialized in evaluating regional captions for remote sensing images.
 
 Your primary task is to meticulously compare the predicted regional caption with the ground truth regional caption and assess their accuracy. To accomplish this, you will evaluate the captions across four key dimensions:
 
@@ -222,149 +484,54 @@ The caption accurately describes the conversion of farmland to residential areas
 <region_containment>5</region_containment>
 <region_containment_explanation>
 The caption focuses exclusively on the changes occurring within the specified region box, with no references to areas outside the designated boundaries. All described features and changes are properly contained within the region of interest, demonstrating perfect adherence to the spatial constraints.
-</region_containment_explanation>"""
+</region_containment_explanation>""",
+
+    "dense_temporal_caption": """You are an advanced intelligent chatbot specialized in evaluating dense temporal captioning for remote sensing image time series.
+
+Your primary task is to meticulously compare the predicted dense temporal caption with the ground truth caption and assess their accuracy. To accomplish this, you will evaluate the captions across three key dimensions:
+
+1. Temporal Coverage: 
+Evaluate how well the predicted caption captures all significant time points and periods of change throughout the entire temporal range. This includes identifying key temporal milestones, maintaining a logical sequence of events, providing appropriate temporal context, and capturing the complete temporal narrative without significant gaps.
+
+2. Spatial Accuracy: 
+Assess how accurately and comprehensively the predicted caption describes the spatial aspects of changes. This includes correctly identifying all regions where significant changes occurred, accurately describing the spatial relationships between different areas, using precise spatial referencing, and ensuring comprehensive coverage of all spatially relevant changes in the image.
+
+3. Process Fidelity:
+Evaluate how accurately and completely the predicted caption describes the nature and processes of change. This includes correctly identifying initial and final land cover/use states, describing intermediate stages of development, capturing the complexity of multiple change processes, and accurately describing the specific features that changed.
+
+Please assign a score for each of these three dimensions, using an integer from 0 to 5, where 5 indicates perfect performance and 0 signifies poor performance. Accompany your assessments with brief explanations to clarify your scoring rationale.
+
+<predicted_caption>
+{predicted_caption}
+</predicted_caption>
+
+<ground_truth_caption>
+{ground_truth_caption}
+</ground_truth_caption>
+
+### OUTPUT FORMAT(EXAMPLE)
+<temporal_coverage>4</temporal_coverage>
+<temporal_coverage_explanation>
+The predicted caption successfully identifies the overall 15-year timeframe and captures key temporal milestones including the development initiation, 2011 halt, 2016 resumption, and 2018-2021 development phase. The chronological order is logical and comprehensive, though it could provide more specific details about the timing of the initial development phase. The caption maintains a clear temporal progression that allows readers to understand the sequence of changes over time.
+</temporal_coverage_explanation>
+
+<spatial_accuracy>5</spatial_accuracy>
+<spatial_accuracy_explanation>
+The caption precisely identifies all significant spatial regions where changes occurred including the top-right, left region, bottom-center, and bottom-right areas with accurate spatial referencing. The spatial coverage is comprehensive, capturing all relevant areas of change mentioned in the ground truth caption. The spatial descriptions effectively communicate the distribution of changes across the image and establish clear relative positions of different development activities.
+</spatial_accuracy_explanation>
+
+<process_fidelity>4</process_fidelity>
+<process_fidelity_explanation>
+The caption accurately describes the transformation from natural and agricultural lands to residential areas with impervious surfaces, buildings, and roads. It captures the phased development process and specifically mentions the office building construction and new water body. The description provides good detail about the conversion processes and infrastructure development. It could provide slightly more detail about the specific characteristics of the residential development in the left region to achieve perfect fidelity.
+</process_fidelity_explanation>"""
+}
 
 
-# Utility classes
-class Summary(Enum):
-    NONE = 0
-    AVERAGE = 1
-    SUM = 2
-    COUNT = 3
-
-
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-
-    def __init__(self, name="", fmt=":f", summary_type=Summary.AVERAGE):
-        self.name = name
-        self.fmt = fmt
-        self.summary_type = summary_type
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-    def __str__(self):
-        fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
-        return fmtstr.format(**self.__dict__)
-
-    def summary(self):
-        fmtstr = ""
-        if self.summary_type is Summary.NONE:
-            fmtstr = ""
-        elif self.summary_type is Summary.AVERAGE:
-            fmtstr = "{name} {avg:.3f}"
-        elif self.summary_type is Summary.SUM:
-            fmtstr = "{name} {sum:.3f}"
-        elif self.summary_type is Summary.COUNT:
-            fmtstr = "{name} {count:.3f}"
-        else:
-            raise ValueError("invalid summary type %r" % self.summary_type)
-        return fmtstr.format(**self.__dict__)
-
-
-# Utility functions
-def dict_to_table(data_dict, headers=None):
-    """Convert dictionary to prettytable"""
-    table = PrettyTable()
-    table.hrules = HRuleStyle.ALL
-
-    max_list_length = max(len(value) for value in data_dict.values()) if data_dict else 0
-
-    if headers is None:
-        headers = ["index"] + [f"value{i + 1}" for i in range(max_list_length)]
-
-    table.field_names = headers
-
-    for key, value_list in data_dict.items():
-        row = [key] + value_list + [""] * (max_list_length - len(value_list))
-        table.add_row(row)
-
-    return table
-
-
-def sam_preprocess(x: torch.Tensor) -> torch.Tensor:
-    """Normalize pixel values and pad to a square input."""
-    x = (x - sam_pixel_mean) / sam_pixel_std
-    h, w = x.shape[-2:]
-    padh = 1024 - h
-    padw = 1024 - w
-    x = F.pad(x, (0, padw, 0, padh))
-    return x
-
-
-def intersectionAndUnionGPU(output, target, K, ignore_index=255):
-    """Calculate intersection and union on GPU"""
-    assert output.dim() in [1, 2, 3]
-    assert output.shape == target.shape
-    output = output.view(-1)
-    target = target.view(-1)
-    output[target == ignore_index] = ignore_index
-    intersection = output[output == target]
-    area_intersection = torch.histc(intersection, bins=K, min=0, max=K - 1)
-    area_output = torch.histc(output, bins=K, min=0, max=K - 1)
-    area_target = torch.histc(target, bins=K, min=0, max=K - 1)
-    area_union = area_output + area_target - area_intersection
-    return area_intersection, area_union, area_target
-
-
-def accuracy(pred, label, ignore_zero=False):
-    """Calculate accuracy"""
-    valid = (label >= 0)
-    if ignore_zero:
-        valid = (label > 0)
-    acc_sum = (valid * (pred == label)).sum()
-    valid_sum = valid.sum()
-    acc = float(acc_sum) / (valid_sum + 1e-10)
-    return acc, valid_sum
-
-
-def fast_hist(a, b, n):
-    """Fast histogram calculation"""
-    k = (a >= 0) & (a < n)
-    return np.bincount(n * a[k].astype(int) + b[k], minlength=n ** 2).reshape(n, n)
-
-
-def get_hist(image, label, num_class):
-    """Get histogram for evaluation"""
-    hist = np.zeros((num_class, num_class))
-    hist += fast_hist(image.flatten(), label.flatten(), num_class)
-    return hist
-
-
-def cal_kappa(hist):
-    """Calculate kappa score"""
-    if hist.sum() == 0:
-        return 0
-    else:
-        po = np.diag(hist).sum() / hist.sum()
-        pe = np.matmul(hist.sum(1), hist.sum(0).T) / hist.sum() ** 2
-        if pe == 1:
-            return 0
-        else:
-            return (po - pe) / (1 - pe)
-
-
-# Async processing functions
 async def process_item(client, data_item, model_name) -> Dict:
-    """Process a single item with retry logic"""
-    if not HAS_OPENAI:
-        raise ImportError("OpenAI package not available")
-
     data_item = copy.deepcopy(data_item)
+
     retry_num, break_flag = 0, False
     response = None
-
     while not break_flag:
         try:
             completion_outputs = await asyncio.wait_for(
@@ -379,27 +546,32 @@ async def process_item(client, data_item, model_name) -> Dict:
                 response = completion_outputs.choices[0].message.content
             except AttributeError:
                 response = None
+
             break_flag = True
 
         except (asyncio.TimeoutError, ConnectionError) as e:
-            logging.error(f"Network exception occurred: {e}")
+            logger.error(f"Network exception occurred: {e}")
 
         except Exception as e:
-            if any(keyword in str(e).lower() for keyword in
-                   ["rate limit", "too many requests", "server error", "connection error"]):
-                logging.error(f"Server error occurred: {e}")
+            if (
+                    "rate limit" in str(e).lower()
+                    or "too many requests" in str(e).lower()
+                    or "server error" in str(e).lower()
+                    or "connection error" in str(e).lower()
+            ):
+                logger.error(f"Server error occurred for: {e}")
             else:
-                logging.error(f"Other error occurred: {e}. skip it")
+                logger.error(f"Other error occurred for: {e}. skip it")
                 break_flag = True
 
         if not break_flag:
-            retry_num += 1
+            retry_num = retry_num + 1
             if retry_num > 10:
-                logging.info("Max retry reached, skipping")
+                logger.info(f"Max Retry reached for, skip it")
                 break_flag = True
             else:
                 wait_time = min(2 ** retry_num, 10)
-                logging.info(f"Retrying in {wait_time} seconds...")
+                logger.info(f"Retrying in {wait_time} seconds...")
                 await asyncio.sleep(wait_time)
 
     return dict(
@@ -409,31 +581,28 @@ async def process_item(client, data_item, model_name) -> Dict:
 
 
 async def process_with_semaphore(client, data_item, model_name, semaphore):
-    """Process item with semaphore control"""
     async with semaphore:
         await asyncio.sleep(random.uniform(0.1, 0.5))
         return await process_item(client, data_item, model_name)
 
 
-async def async_batch_process(
+async def run_gpt_eval(
         batched_requests: List[Dict],
         response_save_path: str,
         model_name: str = "gpt-4.1-mini",
-        n_thread: int = 64,
+        n_thread: int = 128,
         overwrite: bool = False,
 ):
-    """Main async processing function"""
-    if not HAS_OPENAI:
-        raise ImportError("OpenAI package not available")
-
     n_thread = min(n_thread, len(batched_requests))
+
+    # Set Azure OpenAI environment variables
+    os.environ.update(AZURE_CONFIG)
 
     client = AsyncAzureOpenAI(
         azure_endpoint=os.environ.get("AZURE_OPENAI_BASE"),
         api_key=os.environ.get("AZURE_OPENAI_KEY"),
         api_version=os.environ.get("AZURE_OPENAI_API_VERSION"),
     )
-
     try:
         finished_ids = []
         if not overwrite and os.path.exists(response_save_path):
@@ -442,7 +611,6 @@ async def async_batch_process(
                     data_dict = json.loads(line.strip())
                     if data_dict["response"] is not None:
                         finished_ids.append(data_dict["id"])
-
         batched_requests = [data_dict for data_dict in batched_requests if data_dict["custom_id"] not in finished_ids]
 
         tasks = []
@@ -467,103 +635,13 @@ async def async_batch_process(
         if client and hasattr(client, 'close'):
             await client.close()
 
+        # Clean up unfinished tasks
         for task in asyncio.all_tasks(asyncio.get_running_loop()):
             if task is not asyncio.current_task() and not task.done():
                 task.cancel()
 
 
-# Evaluation classes
-class BaseEvaluator:
-    """Base evaluator class"""
-
-    def __init__(self):
-        pass
-
-    def update(self, *args, **kwargs):
-        raise NotImplementedError
-
-    def compute(self):
-        raise NotImplementedError
-
-    def reset(self):
-        raise NotImplementedError
-
-
-class MambaSCDEvaluator(BaseEvaluator):
-    """Semantic Change Detection Evaluator"""
-
-    def __init__(self, n_classes: int):
-        self.n_classes = n_classes
-        self.reset()
-
-    def update(self, label_trues, label_preds, index_name):
-        if not isinstance(label_trues, list):
-            label_trues = [label_trues]
-        if not isinstance(label_preds, list):
-            label_preds = [label_preds]
-        if not isinstance(index_name, list):
-            index_name = [index_name]
-
-        for i, (lt, lp) in enumerate(zip(label_trues, label_preds)):
-            if isinstance(lt, torch.Tensor):
-                lt = lt.cpu().numpy()
-            if isinstance(lp, torch.Tensor):
-                lp = lp.cpu().numpy()
-
-            acc, _ = accuracy(pred=lp, label=lt)
-            self.acc_meter.update(acc)
-
-            index_hist = get_hist(image=lp, label=lt, num_class=self.n_classes)
-            self.hist += index_hist
-            self.index_results[index_name[i]] = self.compute(hist=index_hist)[0]
-
-    def compute(self, hist=None) -> (Dict, Dict):
-        if hist is None:
-            hist = self.hist
-
-        hist_fg = hist[1:, 1:]
-        c2hist = np.zeros((2, 2))
-        c2hist[0][0] = hist[0][0]
-        c2hist[0][1] = hist.sum(1)[0] - hist[0][0]
-        c2hist[1][0] = hist.sum(0)[0] - hist[0][0]
-        c2hist[1][1] = hist_fg.sum()
-        hist_n0 = hist.copy()
-        hist_n0[0][0] = 0
-        kappa_n0 = cal_kappa(hist_n0)
-        iu = np.diag(c2hist) / (c2hist.sum(1) + c2hist.sum(0) - np.diag(c2hist))
-        IoU_fg = iu[1]
-        IoU_mean = (iu[0] + iu[1]) / 2
-        Sek = (kappa_n0 * math.exp(IoU_fg)) / math.e
-
-        pixel_sum = hist.sum()
-        change_pred_sum = pixel_sum - hist.sum(1)[0].sum()
-        change_label_sum = pixel_sum - hist.sum(0)[0].sum()
-        SC_TP = np.diag(hist[1:, 1:]).sum()
-        SC_Precision = SC_TP / (change_pred_sum + 1e-10)
-        SC_Recall = SC_TP / (change_label_sum + 1e-10)
-        Fscd = stats.hmean([SC_Precision, SC_Recall]) if SC_Precision > 0 and SC_Recall > 0 else 0
-
-        results_dict = {
-            "kappa_n0": kappa_n0,
-            "Fscd": Fscd,
-            "IoU_mean": IoU_mean,
-            "IoU_fg": IoU_fg,
-            "Sek": Sek,
-            "Acc": self.acc_meter.avg,
-            "Precision": SC_Precision,
-            "Recall": SC_Recall,
-        }
-        return results_dict, self.index_results
-
-    def reset(self):
-        self.hist = np.zeros((self.n_classes, self.n_classes))
-        self.acc_meter = AverageMeter()
-        self.index_results = {}
-
-
-# Main processing functions
-def process_choice_qa_results(model_list, args):
-    """Process choice QA results"""
+def score_accuracy_tasks(model_list, v0_only=False):
     result_libs = {}
 
     for model in model_list:
@@ -580,7 +658,7 @@ def process_choice_qa_results(model_list, args):
                 if prompt_ver == "finished":
                     prompt_ver = "v0"
 
-                if args.v0_only and prompt_ver != "v0":
+                if v0_only and prompt_ver != "v0":
                     continue
 
                 result_name = f"{model}---{prompt_ver}"
@@ -606,7 +684,7 @@ def process_choice_qa_results(model_list, args):
                         elif "metadata" in doc:
                             metadata = doc["metadata"]
                         else:
-                            raise RuntimeError("Missing metadata")
+                            raise RuntimeError
 
                         if task in ["basic_change_choice_qa", "change_speed_choice_qa"] and metadata[
                             "task_type"] != split:
@@ -618,7 +696,10 @@ def process_choice_qa_results(model_list, args):
                         if task_type == "Single choice":
                             pred = pred.strip().lower()
                             gt = gt.strip().lower()
-                            acc_list.append(1 if pred == gt else 0)
+                            if pred == gt:
+                                acc_list.append(1)
+                            else:
+                                acc_list.append(0)
 
                         elif task_type == "Multiple choice":
                             pred = pred.strip().lower().split(",")
@@ -633,17 +714,39 @@ def process_choice_qa_results(model_list, args):
                             else:
                                 acc_list.append(0)
 
+                        else:
+                            raise ValueError("Unknown task type")
+
                     if len(acc_list) > 0:
                         accuracy = sum(acc_list) / len(acc_list)
                         result_libs[result_name].append(accuracy)
                     else:
                         result_libs[result_name].append(np.nan)
 
-    return result_libs
+    # Format and print results
+    total_score_dict = {}
+    for result_name in result_libs:
+        model, prompt_ver = result_name.split("---")
+        total_score_dict[result_name] = [model, prompt_ver]
+        for acc_value in result_libs[result_name]:
+            if isinstance(acc_value, float):
+                total_score_dict[result_name].append(f"{acc_value:.1%}")
+            else:
+                total_score_dict[result_name].append(acc_value)
+
+    custom_headers = [
+        "index", "method", "prompt_ver", "BCA (single)", "BCA (multi)", "CSE (single)", "CSE (multi)", "EA"
+    ]
+    total_score_dict = {idx: value for idx, value in enumerate(total_score_dict.values())}
+    table = dict_to_table(total_score_dict, custom_headers)
+    print("\n=== Accuracy Task Scores ===")
+    print(table)
+
+    with open(f"{CURRENT_DIR}/accuracy_table.txt", "w") as f:
+        f.write(str(table))
 
 
-def process_report_qa_results(model_list, args):
-    """Process report QA results"""
+def score_generation_tasks(model_list, v0_only=False):
     result_libs = {}
 
     for model in model_list:
@@ -668,7 +771,7 @@ def process_report_qa_results(model_list, args):
                 if prompt_ver == "finished":
                     prompt_ver = "v0"
 
-                if args.v0_only and prompt_ver != "v0":
+                if v0_only and prompt_ver != "v0":
                     continue
 
                 result_name = f"{model}---{prompt_ver}"
@@ -726,82 +829,130 @@ def process_report_qa_results(model_list, args):
                 if task != "dense_temporal_caption":
                     result_libs[result_name].append("")
 
-    return result_libs
+    # Format and print results
+    total_score_dict = {}
+    for result_name in result_libs:
+        modal, prompt_ver = result_name.split("---")
+        total_score_dict[result_name] = [modal, prompt_ver, *result_libs[result_name]]
+
+    custom_headers = [
+        "index", "modal", "prompt_ver",
+        "BCA-AVG", "BCA-TPA", "BCA-LCTIA", "BCA-CQA",
+        "|",
+        "CSE-AVG", "CSE-CRP", "CSE-TPA", "CSE-CPA",
+        "||",
+        "RegCap-AVG", "RegCap-TC", "RegCap-SA", "RegCap-PF", "RegCap-RC",
+        "|||",
+        "DTC-AVG", "DTC-TC", "DTC-SA", "DTC-PF",
+    ]
+    total_score_dict = {idx: value for idx, value in enumerate(total_score_dict.values())}
+    table = dict_to_table(total_score_dict, custom_headers)
+    print("\n=== Generation Task Scores ===")
+    print(table)
+
+    with open(f"{CURRENT_DIR}/generation_table.txt", "w") as f:
+        f.write(str(table))
+
+
+def run_gpt_evaluation(task: str, model_list: List[str], v0_only: bool = False,
+                       debug: bool = False, overwrite: bool = False, n_thread: int = 128):
+    if task not in GPT_PROMPTS:
+        raise ValueError(f"Unknown task for GPT evaluation: {task}")
+
+    prompt_template = GPT_PROMPTS[task]
+
+    for model in model_list:
+        model = model.replace("/", "--")
+        print(f"Processing {model} for task {task}")
+
+        prompt_versions = ["finished", "v0"] if v0_only else ["finished", "v0", "v1", "v2", "v3", "v4"]
+
+        for prompt_ver in prompt_versions:
+            result_json_path = f"{PROJECT_ROOT}/results/multi_temp/{task}/{model}/{prompt_ver}.json"
+            if os.path.exists(result_json_path):
+                with open(result_json_path) as f:
+                    result_data = json.load(f)
+
+                batched_requests = []
+                for doc_idx, doc in enumerate(result_data):
+                    pred = doc["response"]
+                    if "request" in doc:
+                        gt = doc["request"]["ground_truth"]
+                    elif "metadata" in doc:
+                        gt = doc["metadata"]["ground_truth"]
+                    else:
+                        raise RuntimeError
+
+                    # Prepare the prompt based on task type
+                    if task in ["basic_change_report_qa", "change_speed_report_qa"]:
+                        content = prompt_template.format(predicted_result=pred, ground_truth_result=gt)
+                    else:  # regional_caption, dense_temporal_caption
+                        content = prompt_template.format(predicted_caption=pred, ground_truth_caption=gt)
+
+                    request_dict = dict(
+                        custom_id=doc["id"] if "id" in doc else doc_idx,
+                        request=dict(
+                            messages=[
+                                {
+                                    "role": "user",
+                                    "content": content,
+                                }
+                            ],
+                            max_tokens=4096
+                        )
+                    )
+                    batched_requests.append(request_dict)
+
+                response_save_path = result_json_path.replace(".json", ".gpt-4.1-mini.jsonl")
+                asyncio.run(run_gpt_eval(
+                    batched_requests=batched_requests,
+                    response_save_path=response_save_path,
+                    n_thread=1 if debug else n_thread,
+                    overwrite=overwrite
+                ))
 
 
 def main():
-    """Main function to orchestrate different evaluation tasks"""
-    parser = argparse.ArgumentParser(description="Multi-task evaluation script for remote sensing")
-    parser.add_argument('--task', type=str, choices=['choice_qa', 'report_qa', 'segmentation', 'eval_batch'],
-                        default='choice_qa', help='Task to run')
-    parser.add_argument('--api_models', action='store_true', help='Use API models')
-    parser.add_argument('--v0_only', action='store_true', help='Only process v0 prompts')
-    parser.add_argument('--debug', action='store_true', help='Debug mode')
-    parser.add_argument('--overwrite', action='store_true', help='Overwrite existing results')
-    parser.add_argument('--data_type', type=str, default='Optical', help='Data type for evaluation')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', choices=['score', 'gpt_eval'], required=True)
+    parser.add_argument('--task', type=str, default='all')
+    parser.add_argument('--api_models', action='store_true')
+    parser.add_argument('--v0_only', action='store_true')
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--n_thread', type=int, default=128)
     args = parser.parse_args()
 
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
+    # Get model list
+    model_list = API_MODEL_LIST if args.api_models else LOCAL_MODEL_LIST
 
-    # Define model list (remove sensitive information)
-    model_list = [
-        # model names to be evaluate
-    ]
+    if args.mode == 'score':
+        # Run scoring logic
+        if args.task == 'all' or args.task == 'acc':
+            score_accuracy_tasks(model_list, args.v0_only)
+        if args.task == 'all' or args.task == 'gen':
+            score_generation_tasks(model_list, args.v0_only)
 
-    if args.task == 'choice_qa':
-        result_libs = process_choice_qa_results(model_list, args)
+    elif args.mode == 'gpt_eval':
+        # Run GPT evaluation
+        gen_tasks = ["basic_change_report_qa", "change_speed_report_qa", "regional_caption", "dense_temporal_caption"]
 
-        total_score_dict = {}
-        for result_name in result_libs:
-            model, prompt_ver = result_name.split("---")
-            total_score_dict[result_name] = [model, prompt_ver]
-            for acc_value in result_libs[result_name]:
-                if isinstance(acc_value, float):
-                    total_score_dict[result_name].append(f"{acc_value:.1%}")
-                else:
-                    total_score_dict[result_name].append(acc_value)
+        if args.task == 'all':
+            tasks_to_run = gen_tasks
+        elif args.task in gen_tasks:
+            tasks_to_run = [args.task]
+        else:
+            raise ValueError(f"Unknown task: {args.task}. Available tasks: {', '.join(gen_tasks)}")
 
-        custom_headers = ["index", "method", "prompt_ver", "BCA (single)", "BCA (multi)", "CSE (single)", "CSE (multi)",
-                          "EA"]
-        total_score_dict = {idx: value for idx, value in enumerate(total_score_dict.values())}
-        table = dict_to_table(total_score_dict, custom_headers)
-        print(table)
-
-        with open(f"{CURRENT_DIR}/accuracy_table.txt", "w") as f:
-            f.write(str(table))
-
-    elif args.task == 'report_qa':
-        result_libs = process_report_qa_results(model_list, args)
-
-        total_score_dict = {}
-        for result_name in result_libs:
-            modal, prompt_ver = result_name.split("---")
-            total_score_dict[result_name] = [modal, prompt_ver, *result_libs[result_name]]
-
-        custom_headers = [
-            "index", "modal", "prompt_ver",
-            "BCA-AVG", "BCA-TPA", "BCA-LCTIA", "BCA-CQA",
-            "|",
-            "CSE-AVG", "CSE-CRP", "CSE-TPA", "CSE-CPA",
-            "||",
-            "RegCap-AVG", "RegCap-TC", "RegCap-SA", "RegCap-PF", "RegCap-RC",
-            "|||",
-            "DTC-AVG", "DTC-TC", "DTC-SA", "DTC-PF",
-        ]
-        total_score_dict = {idx: value for idx, value in enumerate(total_score_dict.values())}
-        table = dict_to_table(total_score_dict, custom_headers)
-        print(table)
-
-        with open(f"{CURRENT_DIR}/generation_table.txt", "w") as f:
-            f.write(str(table))
-
-    else:
-        print(f"Task {args.task} not implemented in this version")
+        for task in tasks_to_run:
+            run_gpt_evaluation(
+                task=task,
+                model_list=model_list,
+                v0_only=args.v0_only,
+                debug=args.debug,
+                overwrite=args.overwrite,
+                n_thread=args.n_thread
+            )
 
 
 if __name__ == '__main__':
